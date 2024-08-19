@@ -239,11 +239,11 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-                if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
-                    run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
-                } else {
-                    run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(params, stream);
-                }
+                    if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
+                        run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
+                    } else {
+                        run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(params, stream);
+                    }
             });
         });
     });
@@ -1313,7 +1313,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 int window_size_right,
                 const float softcap,
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-                int num_splits
+                int num_splits,
+                c10::optional<at::Tensor> &kvcache_scale_ // kcache_scale and vcache_scale int position 0 and 1
                 ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1330,8 +1331,12 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     if (q_dtype == torch::kBFloat16) {
         TORCH_CHECK(is_sm90 || is_sm8x, "bfloat16 is only supported on Ampere GPUs or newer");
     }
-    TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
-    TORCH_CHECK(vcache.dtype() == q_dtype, "query and value must have the same dtype");
+    // TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
+    // TORCH_CHECK(vcache.dtype() == q_dtype, "query and value must have the same dtype");
+    auto k_dtype = kcache.dtype();
+    TORCH_CHECK(k_dtype == vcache.dtype(), "key and value must have the same dtype");
+    TORCH_CHECK((k_dtype == q_dtype) || (k_dtype == torch::kFloat8_e4m3fn || k_dtype == torch::kFloat8_e5m2),
+            "key and value data type support same with quey or fp8_e4m3 and fp8_e5m2 data type")
 
     CHECK_DEVICE(q); CHECK_DEVICE(kcache); CHECK_DEVICE(vcache);
 
@@ -1458,8 +1463,13 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         TORCH_CHECK(seqlen_q <= seqlen_k, "If key is supplied, it must have seqlen <= the seqlen of the KV cache");
         k = k_.value();
         v = v_.value();
-        TORCH_CHECK(k.dtype() == q_dtype, "Key must have the same dtype as query");
-        TORCH_CHECK(v.dtype() == q_dtype, "Value must have the same dtype as query");
+        // TORCH_CHECK(k.dtype() == q_dtype, "Key must have the same dtype as query");
+        // TORCH_CHECK(v.dtype() == q_dtype, "Value must have the same dtype as query");
+
+        TORCH_CHECK(k_dtype == vcache.dtype(), "key and value must have the same dtype");
+        TORCH_CHECK((k_dtype == q_dtype) || (k_dtype == torch::kFloat8_e4m3fn || k_dtype == torch::kFloat8_e5m2),
+                "key and value data type support same with quey or fp8_e4m3 and fp8_e5m2 data type")
+
         CHECK_DEVICE(k); CHECK_DEVICE(v);
         TORCH_CHECK(k.stride(-1) == 1, "Key tensor must have contiguous last dimension");
         TORCH_CHECK(v.stride(-1) == 1, "Value tensor must have contiguous last dimension");
@@ -1483,6 +1493,21 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         params.vnew_row_stride = v_padded.stride(-3);
         params.knew_head_stride = k_padded.stride(-2);
         params.vnew_head_stride = v_padded.stride(-2);
+
+        if (k_dtype == q_dtype) {
+            params.kvcache_dtype = 0;
+        } else {
+            TORCH_CHECK(kvcache_scale_.has_value(), "If key and value in kFloat8_e4m3fn/kFloat8_e5m2 is supplied, scale value must also be passed in");
+            auto kvcache_scale = kvcache_scale_.value();
+            TORCH_CHECK(kvcache_scale.dtype() == q_dtype, "kvcache_scale data type must be same with query data type"); 
+            if (k_dtype == torch::kFloat8_e4m3fn) {
+                params.kvcache_dtype = 1;
+            }
+            else if (k_dtype == torch::kFloat8_e5m2) {
+                params.kvcache_dtype = 2;
+            }
+            params.kvcache_scale = reinterpret_cast<void *>(kvcache_scale.data_ptr());
+        }
     }
 
     if (seqlens_k_.has_value()) {

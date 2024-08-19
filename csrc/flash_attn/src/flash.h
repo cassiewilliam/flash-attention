@@ -130,6 +130,10 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_bf16;
     bool is_causal;
 
+    // 0: means sample with q dtype, 1: means fp8_e4m3 dtype, 2: means fp8_e5m2 dtype
+    int kvcache_dtype;
+    void * __restrict__ kvcache_scale;
+
     // If is_seqlens_k_cumulative, then seqlen_k is cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb].
     // Otherwise it's cu_seqlens_k[bidb], i.e., we use cu_seqlens_k to store the sequence lengths of K.
     bool is_seqlens_k_cumulative;

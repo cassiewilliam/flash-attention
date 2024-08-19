@@ -12,7 +12,7 @@
 
 using namespace cute;
 
-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::half_t>
+template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::half_t, typename kv_elem_type=cutlass::half_t>
 struct Flash_kernel_traits {
 
 #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800
@@ -26,6 +26,8 @@ struct Flash_kernel_traits {
     using ElementAccum = float;
     using index_t = int64_t;
 
+    using ElementKV = kv_elem_type;
+
 #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800
     using MMA_Atom_Arch = std::conditional_t<
         std::is_same_v<elem_type, cutlass::half_t>,
@@ -38,22 +40,34 @@ struct Flash_kernel_traits {
 
 #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 750
     using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
-    using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;
+    using SmemCopyKAtom = std::conditional_t<
+        std::is_same_v<kv_elem_type, cutlass::half_t> || std::is_same_v<kv_elem_type, cutlass::bfloat16_t>,
+        Copy_Atom<SM75_U32x4_LDSM_N, kv_elem_type>,
+        Copy_Atom<SM75_U32x2_LDSM_N, kv_elem_type>
+    >;
+    using SmemCopyAtomTransposed = std::conditional_t<
+        std::is_same_v<kv_elem_type, cutlass::half_t> || std::is_same_v<kv_elem_type, cutlass::bfloat16_t>,
+        Copy_Atom<SM75_U16x8_LDSM_T, kv_elem_type>,
+        Copy_Atom<SM75_U16x4_LDSM_T, kv_elem_type>
+    >;
 #else
     using SmemCopyAtom = Copy_Atom<DefaultCopy, elem_type>;
-    using SmemCopyAtomTransposed = Copy_Atom<DefaultCopy, elem_type>;
+    using SmemCopyKAtom = Copy_Atom<DefaultCopy, kv_elem_type>;
+    using SmemCopyAtomTransposed = Copy_Atom<DefaultCopy, kv_elem_type>;
 #endif
 };
 
 // If Share_Q_K_smem is true, that forces Is_Q_in_regs to be true
-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, bool Is_Q_in_regs_=false, bool Share_Q_K_smem_=false, typename elem_type=cutlass::half_t,
-         typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type> >
+template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, bool Is_Q_in_regs_=false, bool Share_Q_K_smem_=false, typename elem_type=cutlass::half_t, typename kv_elem_type=cutlass::half_t, 
+         typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type, kv_elem_type> >
 struct Flash_fwd_kernel_traits : public Base {
     using Element = typename Base::Element;
     using ElementAccum = typename Base::ElementAccum;
+    using ElementKV = typename Base::ElementKV;
     using index_t = typename Base::index_t;
     static constexpr bool Has_cp_async = Base::Has_cp_async;
     using SmemCopyAtom = typename Base::SmemCopyAtom;
+    using SmemCopyKAtom = typename Base::SmemCopyKAtom;
     using SmemCopyAtomTransposed = typename Base::SmemCopyAtomTransposed;
 
     static constexpr bool Share_Q_K_smem = Share_Q_K_smem_;
@@ -105,7 +119,7 @@ struct Flash_fwd_kernel_traits : public Base {
     using SmemCopyAtomOaccum = Copy_Atom<DefaultCopy, ElementAccum>;
 
     static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
-    static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
+    static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(ElementKV);
     static constexpr int kSmemSize = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize;
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
@@ -122,13 +136,24 @@ struct Flash_fwd_kernel_traits : public Base {
 
     // We use CACHEGLOBAL instead of CACHEALWAYS for both Q and K/V, since we won't be reading
     // from the same address by the same threadblock. This is slightly faster.
-    using Gmem_copy_struct = std::conditional_t<
+    using Gmem_copyQ_struct = std::conditional_t<
         Has_cp_async,
         SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>,
         DefaultCopy
     >;
-    using GmemTiledCopyQKV = decltype(
-        make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
+
+    using Gmem_copyKV_struct = std::conditional_t<
+        Has_cp_async,
+        SM80_CP_ASYNC_CACHEGLOBAL<cute::uint64_t>,
+        DefaultCopy
+    >;
+
+    using GmemTiledCopyQ = decltype(
+        make_tiled_copy(Copy_Atom<Gmem_copyQ_struct, Element>{},
+                        GmemLayoutAtom{},
+                        Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
+    using GmemTiledCopyKV = decltype(
+        make_tiled_copy(Copy_Atom<Gmem_copyKV_struct, ElementKV>{},
                         GmemLayoutAtom{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
     using GmemTiledCopyO = decltype(

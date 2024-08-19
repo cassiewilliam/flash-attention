@@ -87,6 +87,20 @@
     }                                        \
   }()
 
+#define KV_DTYPE_SWITCH(KVDTYPE, ELEMTYPE, ...) \
+  [&] {                                         \
+      if (KVDTYPE == 0) {                       \
+        using KV_T = ELEMTYPE;                  \
+        return __VA_ARGS__();                   \
+      } else if (KVDTYPE == 1) {                \
+        using KV_T = cutlass::float_e4m3_t;     \
+        return __VA_ARGS__();                   \
+      } else if (KVDTYPE == 2) {                \
+        using KV_T = cutlass::float_e5m2_t;     \
+        return __VA_ARGS__();                   \
+      }                                         \
+  }()
+
 #define HEADDIM_SWITCH(HEADDIM, ...)   \
   [&] {                                    \
     if (HEADDIM <= 32) {                   \
